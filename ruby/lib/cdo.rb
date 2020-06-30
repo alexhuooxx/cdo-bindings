@@ -9,7 +9,7 @@ class Hash
   alias :include? :has_key?
 end
 
-# Copyright 2011-2019 Ralf Mueller, ralf.mueller@dkrz.de
+# Copyright 2011-2020 Ralf Mueller, ralf.mueller@dkrz.de
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -59,57 +59,23 @@ class Cdo
   splitseas splitsel splittabnum splitvar splityear splityearmon splitzaxis]
 
 
-  attr_accessor :cdo, :returnCdf, :forceOutput, :env, :debug, :logging, :logFile
-  attr_reader   :operators, :filetypes, :hasNetcdf
-
-  def initialize(cdo: 'cdo',
-                 returnFalseOnError: false,
-                 returnNilOnError: false,
-                 forceOutput: true,
-                 env: {},
-                 debug: false,
-                 tempdir: Dir.tmpdir,
-                 logging: false,
-                 logFile: StringIO.new)
-
-    # setup path to cdo executable
-    @cdo = ENV.has_key?('CDO') ? ENV['CDO'] : cdo
-
-    @operators              = getOperators(@cdo)
-    @noOutputOperators      = @operators.select {|op,io| 0 == io}.keys
-
-    @hasNetcdf              = loadOptionalLibs
-
-    @forceOutput            = forceOutput
-    @env                    = env
-    @debug                  = ENV.has_key?('DEBUG') ? true : debug
-    @returnNilOnError       = returnNilOnError
-    @returnFalseOnError     = returnFalseOnError
-
-    @tempStore              = CdoTempfileStore.new(tempdir)
-    @logging                = logging
-    @logFile                = logFile
-    @logger                 = Logger.new(@logFile,'daily')
-    @logger.level           = Logger::INFO
-
-    @config                 = getFeatures
-
-    # create methods to descibe what can be done with the binary
-    @config.each {|k,v|
-      self.class.send :define_method, k.tr('-','_') do
-        v
-      end
-    }
-
-    # ignore return code 1 for diff operators (from 1.9.6 onwards)
-    @exit_success = lambda {|operatorName|
-      return 0 if version < '1.9.6'
-      return 0 if 'diff' != operatorName[0,4]
-      return 1
-    }
+  # class methods {{{
+  # make sure the error behaviour is limtted to nil or false
+  def Cdo.checkReturnOnError(returnOnError)
+    unless [:noop, nil, false].include?(returnOnError) then
+      warn "Wrong return value provided: '#{returnOnError.to_s}'"
+      warn "Please use 'nil' or 'false' or leave it untouched"
+      exit(1)
+    end
   end
 
-  private # {{{
+  def Cdo.returnOrRaise(returnOnError, error,message)
+    unless :noop == returnOnError then
+      return returnOnError
+    else
+      raise error, message
+    end
+  end
 
   # split arguments into hash-like args and the rest
   def Cdo.parseArgs(args)
@@ -123,19 +89,73 @@ class Cdo
 
     return [io,opArguments]
   end
+  # }}}
+
+
+  attr_accessor :cdo, :returnCdf, :forceOutput, :env, :debug, :logging, :logFile
+  attr_reader   :operators, :filetypes, :hasNetcdf, :config
+
+  def initialize(cdo: 'cdo',            # path to binary {{{
+                 returnOnError: :noop,  # return behaviour in case of error: false,  nil, raise exception (default)
+                 forceOutput: true,     # force overwriting of output files that might already exist (default: true)
+                 env: {},               # additional environment settings, that are passde to all operator callse
+                 debug: false,          # show commands and further output of internal processing
+                 tempdir: Dir.tmpdir,   # optional directory for storing
+                                        # temporary files (in order to avoid filling up system /tmp)
+                 logFile: '')           # log commands into a separate file
+
+    # setup path to cdo executable
+    @cdo = ENV.has_key?('CDO') ? ENV['CDO'] : cdo
+
+    @operators              = getOperators
+    @noOutputOperators      = @operators.select {|op,io| 0 == io}.keys
+
+    @hasNetcdf              = loadOptionalLibs
+
+    @forceOutput            = forceOutput
+    @env                    = env
+    @debug                  = ENV.has_key?('DEBUG') ? true : debug
+
+    Cdo.checkReturnOnError(@returnOnError)
+
+    @tempStore              = CdoTempfileStore.new(tempdir)
+
+    @logFile                = logFile
+    @logging                = (logFile.empty?) ? false : true
+    if @logging then
+      @logger                 = Logger.new(@logFile,'daily') if 
+      @logger.level           = Logger::INFO
+    end
+
+    # create methods to descibe what can be done with the binary
+    getFeatures.each {|k,v|
+      self.class.send :define_method, k.tr('-','_') do
+        v
+      end
+    }
+
+    # ignore return code 1 for diff operators (from 1.9.6 onwards)
+    @exit_success = lambda {|operatorName|
+      return 0 if version < '1.9.6'
+      return 0 if 'diff' != operatorName[0,4]
+      return 1
+    }
+  end #}}}
+
+  private # {{{
 
   # collect the complete list of possible operators
-  def getOperators(path2cdo) #{{{
+  def getOperators #{{{
     operators = {}
 
     # little side note: the option --operators_no_output works in 1.8.0 and
     # 1.8.2, but not in 1.9.0, from 1.9.1 it works again
     case
     when version < '1.7.2' then
-      cmd       = path2cdo + ' 2>&1'
+      cmd       = @cdo + ' 2>&1'
       help      = IO.popen(cmd).readlines.map {|l| l.chomp.lstrip}
       if 5 >= help.size
-        warn "Operators could not get listed by running the CDO binary (#{path2cdo})"
+        warn "Operators could not get listed by running the CDO binary (#{@cdo})"
         pp help if @debug
         exit
       end
@@ -154,7 +174,7 @@ class Cdo
       }
 
     when (version < '1.8.0'  or '1.9.0' == version) then
-      cmd                = "#{path2cdo} --operators"
+      cmd                = "#{@cdo} --operators"
       _operators         = IO.popen(cmd).readlines.map {|l| l.split(' ').first }
 
       _operators.each {|op| operators[op] = 1 }
@@ -167,9 +187,9 @@ class Cdo
 
     when version < '1.9.3' then
 
-      cmd                = "#{path2cdo} --operators"
+      cmd                = "#{@cdo} --operators"
       _operators         = IO.popen(cmd).readlines.map {|l| l.split(' ').first }
-      cmd                = "#{path2cdo} --operators_no_output"
+      cmd                = "#{@cdo} --operators_no_output"
       _operatorsNoOutput = IO.popen(cmd).readlines.map {|l| l.split(' ').first }
 
       # build up operator inventory
@@ -182,7 +202,7 @@ class Cdo
       }
 
     else
-      cmd       = "#{path2cdo} --operators"
+      cmd       = "#{@cdo} --operators"
       operators = {}
       IO.popen(cmd).readlines.map {|line|
         lineContent        = line.chomp.split(' ')
@@ -194,8 +214,8 @@ class Cdo
     return operators
   end #}}}
 
-  # get meta-data about the CDO installation
-  def getFeatures
+  # get meta-data about the CDO installation 
+  def getFeatures # {{{
     config = {}
     config.default(false)
 
@@ -211,7 +231,8 @@ class Cdo
       }
     end
     config
-  end
+  end # }}}
+
 
   # Execute the given cdo call and return all outputs
   def _call(cmd,env={})
@@ -360,16 +381,16 @@ class Cdo
 
   # Implementation of operator calls using ruby's meta programming skills
   #
-  # args is expected to look like
-  #   [opt1,...,optN,:input => iStream,:output => oStream, :options => ' ']
-  #   where iStream could be another CDO call (timmax(selname(Temp,U,V,ifile.nc))
+  # args is expected to look like a list of scalar arguments, keyword arguments
+  # are not longer supported:
+  #    cdo.methA('r10x2').divc(7).add.infiles('ifileA').mulc(0.1).infiles('ifileB')
   def method_missing(sym, *args, &block)
     operatorName = sym.to_s
     puts "Operator #{operatorName} is called" if @debug
 
     # exit eary on missing operator
     unless @operators.include?(operatorName)
-      return false if @returnFalseOnError
+      return @returnOnError if false != @returnOnError
       raise ArgumentError,"Operator #{operatorName} not found"
     end
 
