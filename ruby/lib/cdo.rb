@@ -89,12 +89,28 @@ class Cdo
 
     return [io,opArguments]
   end
+
+  # ignore return code 1 for diff operators (from 1.9.6 onwards)
+  def Cdo.exit_success(operator, version)
+    return 0 if version < '1.9.6'
+    return 0 if 'diff' != operator[0,4]
+    return 1
+  end
+
+  def Cdo.copyAndAddCommand(object, command)
+    newObj = object.clone
+    newObj.addCommand(command)
+    newObj
+  end
   # }}}
 
 
-  attr_accessor :cdo, :returnCdf, :forceOutput, :env, :debug, :logging, :logFile
-  attr_reader   :operators, :filetypes, :hasNetcdf, :config, :cmd
+  attr_accessor :cdo, :forceOutput, :env, :debug, :logFile
+  attr_reader   :operators, :hasNetcdf, :config, :cmd, :env, :tempStore
 
+  def addCommand(command)
+    @command << command
+  end
   def initialize(cdo: 'cdo',            # path to binary {{{
                  returnOnError: :noop,  # return behaviour in case of error: false,  nil, raise exception (default)
                  forceOutput: true,     # force overwriting of output files that might already exist (default: true)
@@ -105,8 +121,9 @@ class Cdo
                  logFile: '')           # log commands into a separate file
 
     # setup path to cdo executable
-    @cdo = ENV.has_key?('CDO') ? ENV['CDO'] : cdo
-    @cmd = []
+    @cdo                    = (ENV.has_key?('CDO') and File.executable?(ENV['CDO']))? ENV['CDO'] : cdo
+    @command                = []
+    @lastOp                 = ''
 
     @operators              = getOperators
     @noOutputOperators      = @operators.select {|op,io| 0 == io}.keys
@@ -135,12 +152,6 @@ class Cdo
       end
     }
 
-    # ignore return code 1 for diff operators (from 1.9.6 onwards)
-    @exit_success = lambda {|operatorName|
-      return 0 if version < '1.9.6'
-      return 0 if 'diff' != operatorName[0,4]
-      return 1
-    }
   end #}}}
 
   private
@@ -235,7 +246,7 @@ class Cdo
   end # }}}
 
   # Execute the given cdo call and return all outputs
-  def call(cmd,env={})
+  def call(cmd,env={}) # {{{
     @logger.info(cmd+"\n") if @logging
 
     stdin, stdout, stderr, wait_thr = Open3.popen3(@env.merge(env),cmd)
@@ -266,14 +277,14 @@ class Cdo
     end
 
     status
-  end
+  end # }}}
 
   # Error handling for the given command
-  def _hasError(cmd,operatorName,retvals)
+  def _hasError(cmd,operatorName,retvals) # {{{
     if @debug
       puts("RETURNCODE: #{retvals[:returncode]}")
     end
-    if ( @exit_success[operatorName] < retvals[:returncode] )
+    if ( Cdo.exit_success(operatorName,version) < retvals[:returncode] )
       puts("Error in calling:")
       puts(">>> "+cmd+"<<<")
       puts(retvals[:stderr])
@@ -282,11 +293,11 @@ class Cdo
     else
       return false
     end
-  end
+  end # }}}
 
 
   # load the netcdf bindings
-  def loadOptionalLibs
+  def loadOptionalLibs # {{{
     begin
       require "numru/netcdf_miss"
       return true
@@ -294,7 +305,7 @@ class Cdo
       warn "Could not load ruby's netcdf bindings"
       return false
     end
-  end
+  end # }}}
 
   # Implementation of operator calls using ruby's meta programming skills
   #
@@ -302,7 +313,7 @@ class Cdo
   # are not longer supported:
   #    cdo.methA('r10x2').divc(7).add.infiles('ifileA').mulc(0.1).infiles('ifileB')
   def method_missing(sym, *args, &block)
-    operatorName = '-'+sym.to_s
+    operatorName, @lastOp = '-'+sym.to_s, sym.to_s
     puts "Operator #{operatorName} is called" if @debug
 
     # exit early on an unknown operator
@@ -310,30 +321,41 @@ class Cdo
       Cdo.returnOrRaise(@returnOnError, ArgumentError,"Operator #{operatorName} not found")
     end
 
-    operatorName << ",#{args.join(',')}" unless args.empty?
+    #if the input is a Cdo object itself, its commands get added instead of the objects name
+    args.each {|arg|
+      if arg.kind_of?(Cdo) then
+        operatorName << ' ' << arg.cmd
+      else
+        operatorName << ",#{arg}"
+      end
+    }
 
-    @cmd << operatorName
-    self
+    Cdo.copyAndAddCommand(self, operatorName)
   end
+
+  def respond_to_missing?(method, *)
+    @operators.include?(method.to_s) || super
+  end
+
+
 
   public
 
   # pass regular file input here (or lists of them)
   def infiles(*args)
-    args.each {|file| @cmd << file }
+    args.each {|file| @command << file }
     self
   end
 
   # command execution wrapper, which handles the possible return types
-  def run(input:         nil,
-           output:        nil,
-           options:       '',
-           returnCdf:     false,
-           force:         nil,
-           returnArray:   nil,
-           returnMaArray: nil,
-           env:           nil,
-           autoSplit:     nil)
+  def run(output:        nil,
+          options:       '',
+          returnCdf:     false,
+          force:         nil,
+          returnArray:   nil,
+          returnMaArray: nil,
+          env:           nil,
+          autoSplit:     nil)
 
     # switch netcdf output if data of filehandles are requested as output
     options << ' -f nc' if ( \
@@ -343,13 +365,13 @@ class Cdo
                            )
 
     # setup basic operator execution command
-    if @cmd.empty? then
+    if @command.empty? then
       warn "cannot run empty command!"
       exit 1
     end
     cmd = [@cdo]
     cmd << options
-    cmd << @cmd.join(' ')
+    cmd << @command.join(' ')
     cmd = cmd.join(' ')
 
     # use an empty hash for non-given environment
@@ -386,15 +408,15 @@ class Cdo
         # create tempfile(s) according to the number of output streams needed
         # if output argument is missing
         if output.nil? then
-          operators[operatorName].times { outputs << @tempStore.newFile}
+          @operators[@lastOp].times { outputs << @tempStore.newFile}
         end
 
         #finalize the execution command
-        cmd << "#{outputs.join(' ')}"
+        cmd << " #{outputs.join(' ')}"
 
         retvals = call(cmd,env)
 
-        if _hasError(cmd,operatorName,retvals)
+        if _hasError(cmd,@lastOp,retvals)
           if @returnNilOnError then
             return nil
           else
@@ -416,7 +438,7 @@ class Cdo
     elsif returnCdf
       retval = outputs.map{|f| readCdf(f)}
       return 1 == retval.size ? retval[0] : retval
-    elsif /^split/.match(operatorName)
+    elsif /^split/.match(@lastOp)
       Dir.glob("#{output}*")
     else
       return outputs[0] if outputs.size == 1
@@ -474,6 +496,11 @@ class Cdo
     else
       return info.first.split(/version/i).last.strip.split(' ').first
     end
+  end
+
+  # print internal command line
+  def cmd
+    @command.join(' ')
   end
 
   # return cdf handle to given file readonly
@@ -550,6 +577,8 @@ end
 class CdoTempfileStore
   # base for persitent temp files - just for debugging
   N = 10000000
+
+  attr_reader :dir
 
   def initialize(dir=Dir.tmpdir)
     @dir                  = dir
