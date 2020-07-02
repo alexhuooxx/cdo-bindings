@@ -106,6 +106,7 @@ class Cdo
 
     # setup path to cdo executable
     @cdo = ENV.has_key?('CDO') ? ENV['CDO'] : cdo
+    @cmd = []
 
     @operators              = getOperators
     @noOutputOperators      = @operators.select {|op,io| 0 == io}.keys
@@ -233,9 +234,8 @@ class Cdo
     config
   end # }}}
 
-
   # Execute the given cdo call and return all outputs
-  def _call(cmd,env={})
+  def call(cmd,env={})
     @logger.info(cmd+"\n") if @logging
 
     stdin, stdout, stderr, wait_thr = Open3.popen3(@env.merge(env),cmd)
@@ -284,10 +284,44 @@ class Cdo
     end
   end
 
+
+  # Implementation of operator calls using ruby's meta programming skills
+  #
+  # args is expected to look like a list of scalar arguments, keyword arguments
+  # are not longer supported:
+  #    cdo.methA('r10x2').divc(7).add.infiles('ifileA').mulc(0.1).infiles('ifileB')
+  def method_missing(sym, *args, &block)
+    operatorName = '-'+sym.to_s
+    puts "Operator #{operatorName} is called" if @debug
+
+    # exit early on an unknown operator
+    unless @operators.include?(operatorName)
+      Cdo.returnOrRaise(ArgumentError,"Operator #{operatorName} not found")
+    end
+
+    operatorName << ",#{args.join(',')}" unless args.empty?
+
+    self.cmd << operator
+    self
+  end
+
+  # load the netcdf bindings
+  def loadOptionalLibs
+    begin
+      require "numru/netcdf_miss"
+      return true
+    rescue
+      warn "Could not load ruby's netcdf bindings"
+      return false
+    end
+  end
+
+  # }}}
+
+  public  # {{{
+
   # command execution wrapper, which handles the possible return types
-  def _run(operatorName,
-           operatorParameters,
-           input:         nil,
+  def run(input:         nil,
            output:        nil,
            options:       '',
            returnCdf:     false,
@@ -305,7 +339,14 @@ class Cdo
                            )
 
     # setup basic operator execution command
-    cmd = "#{@cdo} -O #{options} -#{operatorName}#{operatorParameters} #{input} "
+    if @cmd.empty? then
+      warn "cannot run empty command!"
+      exit 1
+    end
+    cmd = [@cdo]
+    cmd << options
+    cmd << @cmd.join(' ')
+    cmd = cmd.join(' ')
 
     # use an empty hash for non-given environment
     env = {} if env.nil?
@@ -318,7 +359,7 @@ class Cdo
 
     case output
     when $stdout
-      retvals = _call(cmd,env)
+      retvals = call(cmd,env)
       unless _hasError(cmd,operatorName,retvals)
         _output = retvals[:stdout].split($/).map {|l| l.chomp.strip}
         unless autoSplit.nil?
@@ -347,7 +388,7 @@ class Cdo
         #finalize the execution command
         cmd << "#{outputs.join(' ')}"
 
-        retvals = _call(cmd,env)
+        retvals = call(cmd,env)
 
         if _hasError(cmd,operatorName,retvals)
           if @returnNilOnError then
@@ -378,52 +419,13 @@ class Cdo
       return outputs
     end
   end
-
-  # Implementation of operator calls using ruby's meta programming skills
-  #
-  # args is expected to look like a list of scalar arguments, keyword arguments
-  # are not longer supported:
-  #    cdo.methA('r10x2').divc(7).add.infiles('ifileA').mulc(0.1).infiles('ifileB')
-  def method_missing(sym, *args, &block)
-    operatorName = sym.to_s
-    puts "Operator #{operatorName} is called" if @debug
-
-    # exit eary on missing operator
-    unless @operators.include?(operatorName)
-      return @returnOnError if false != @returnOnError
-      raise ArgumentError,"Operator #{operatorName} not found"
-    end
-
-    io, operatorParameters = Cdo.parseArgs(args)
-
-    # mark calls for operators without output files
-    io[:output] = $stdout if @noOutputOperators.include?(operatorName)
-
-    _run(operatorName,operatorParameters,**io)
-  end
-
-  # load the netcdf bindings
-  def loadOptionalLibs
-    begin
-      require "numru/netcdf_miss"
-      return true
-    rescue
-      warn "Could not load ruby's netcdf bindings"
-      return false
-    end
-  end
-
-  # }}}
-
-  public  # {{{
-
   # show Cdo's built-in help for given operator
   def help(operator=nil)
     if operator.nil?
-      puts _call([@cdo,'-h'].join(' '))[:stderr]
+      puts call([@cdo,'-h'].join(' '))[:stderr]
     else
       operator = operator.to_s
-      puts _call([@cdo,'-h',operator].join(' ')).values_at(:stdout,:stderr)
+      puts call([@cdo,'-h',operator].join(' ')).values_at(:stdout,:stderr)
     end
   end
 
@@ -454,7 +456,7 @@ class Cdo
   def check
     return false unless hasCdo
 
-    retval = _call("#{@cdo} -V")
+    retval = call("#{@cdo} -V")
     pp retval if @debug
 
     return true
