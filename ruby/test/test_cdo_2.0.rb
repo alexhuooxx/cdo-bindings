@@ -28,4 +28,9 @@ class TestCdo < Minitest::Test
     assert(@cdo.respond_to?(:has_nc4), "Could not find netcdf4 output format")
     assert(@cdo.respond_to?(:has_nc5), "Could not find netcdf5 output format")
   end
+
+  def test_chainternal
+    obj = @cdo.methA('r10x2').divc(7).add.infiles('ifileA').mulc(0.1).infiles('ifileB')
+    puts obj.cmd.join(' ')
+  end
 end

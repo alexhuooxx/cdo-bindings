@@ -93,7 +93,7 @@ class Cdo
 
 
   attr_accessor :cdo, :returnCdf, :forceOutput, :env, :debug, :logging, :logFile
-  attr_reader   :operators, :filetypes, :hasNetcdf, :config
+  attr_reader   :operators, :filetypes, :hasNetcdf, :config, :cmd
 
   def initialize(cdo: 'cdo',            # path to binary {{{
                  returnOnError: :noop,  # return behaviour in case of error: false,  nil, raise exception (default)
@@ -143,10 +143,10 @@ class Cdo
     }
   end #}}}
 
-  private # {{{
+  private
 
   # collect the complete list of possible operators
-  def getOperators #{{{
+  def getOperators # {{{
     operators = {}
 
     # little side note: the option --operators_no_output works in 1.8.0 and
@@ -285,26 +285,6 @@ class Cdo
   end
 
 
-  # Implementation of operator calls using ruby's meta programming skills
-  #
-  # args is expected to look like a list of scalar arguments, keyword arguments
-  # are not longer supported:
-  #    cdo.methA('r10x2').divc(7).add.infiles('ifileA').mulc(0.1).infiles('ifileB')
-  def method_missing(sym, *args, &block)
-    operatorName = '-'+sym.to_s
-    puts "Operator #{operatorName} is called" if @debug
-
-    # exit early on an unknown operator
-    unless @operators.include?(operatorName)
-      Cdo.returnOrRaise(ArgumentError,"Operator #{operatorName} not found")
-    end
-
-    operatorName << ",#{args.join(',')}" unless args.empty?
-
-    self.cmd << operator
-    self
-  end
-
   # load the netcdf bindings
   def loadOptionalLibs
     begin
@@ -316,9 +296,33 @@ class Cdo
     end
   end
 
-  # }}}
+  # Implementation of operator calls using ruby's meta programming skills
+  #
+  # args is expected to look like a list of scalar arguments, keyword arguments
+  # are not longer supported:
+  #    cdo.methA('r10x2').divc(7).add.infiles('ifileA').mulc(0.1).infiles('ifileB')
+  def method_missing(sym, *args, &block)
+    operatorName = '-'+sym.to_s
+    puts "Operator #{operatorName} is called" if @debug
 
-  public  # {{{
+    # exit early on an unknown operator
+    unless @operators.include?(operatorName)
+      Cdo.returnOrRaise(@returnOnError, ArgumentError,"Operator #{operatorName} not found")
+    end
+
+    operatorName << ",#{args.join(',')}" unless args.empty?
+
+    @cmd << operatorName
+    self
+  end
+
+  public
+
+  # pass regular file input here (or lists of them)
+  def infiles(*args)
+    args.each {|file| @cmd << file }
+    self
+  end
 
   # command execution wrapper, which handles the possible return types
   def run(input:         nil,
